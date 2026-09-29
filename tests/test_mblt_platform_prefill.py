@@ -482,3 +482,25 @@ class TestMbltPlatformPrefill:
             assert is_pin_memory_available() is False
         finally:
             is_pin_memory_available.cache_clear()
+
+
+class TestMbltPlatformProcessorCache:
+    @staticmethod
+    def _config(model_type: str, mm_processor_cache_gb: float) -> SimpleNamespace:
+        config = _make_vllm_config(None, hf_model_type=model_type)
+        config.model_config.multimodal_config = SimpleNamespace(mm_processor_cache_gb=mm_processor_cache_gb)
+        return config
+
+    def test_platform_disables_the_processor_cache_for_qwen3_asr(self) -> None:
+        config = self._config("mobilint-qwen3_asr", 4)
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.model_config.multimodal_config.mm_processor_cache_gb == 0
+
+    def test_platform_keeps_the_processor_cache_for_other_multimodal_models(self) -> None:
+        config = self._config("mobilint-qwen3_vl", 4)
+
+        MbltPlatform.check_and_update_config(config)
+
+        assert config.model_config.multimodal_config.mm_processor_cache_gb == 4
