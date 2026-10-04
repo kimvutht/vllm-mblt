@@ -17,6 +17,8 @@ _MULTIMODAL_HF_MODEL_TYPES = frozenset(
         "mobilint-qwen3_vl",
     }
 )
+# Qwen3-ASR audio past this token can stall the NPU; the artifact config declares 65536.
+_QWEN3_ASR_MAX_MODEL_LEN = 2048
 _TRUE_ENV_VALUES = {"1", "true", "TRUE", "True"}
 # A batch LLM compiled at a global scheme mixes core modes inside one mxq (the
 # collective segments target the cluster GlobalCore, the iterative ones Core0),
@@ -363,6 +365,16 @@ class MbltPlatform(Platform):
                 multimodal_config.mm_processor_cache_gb,
             )
             multimodal_config.mm_processor_cache_gb = 0
+
+        if _is_qwen3_asr_hf_config(_get_hf_config(vllm_config)):
+            model_config = vllm_config.model_config
+            if model_config.max_model_len > _QWEN3_ASR_MAX_MODEL_LEN:
+                logger.warning(
+                    "Clamping max_model_len from %d to %d for Qwen3-ASR.",
+                    model_config.max_model_len,
+                    _QWEN3_ASR_MAX_MODEL_LEN,
+                )
+                model_config.max_model_len = _QWEN3_ASR_MAX_MODEL_LEN
 
         scheduler_config: SchedulerConfig = vllm_config.scheduler_config
 

@@ -123,7 +123,7 @@ Qwen3-ASR needs the optional `qwen-asr` extra:
 
 ```bash
 pip install "vllm-mblt[qwen-asr]"
-vllm serve mobilint/Qwen3-ASR-1.7B --trust-remote-code --max-model-len 2048 --max-num-seqs 1
+vllm serve mobilint/Qwen3-ASR-1.7B --trust-remote-code --max-num-seqs 1
 ```
 
 It serves vLLM's OpenAI-compatible transcription endpoint:
@@ -137,9 +137,8 @@ Current Mobilint Qwen3-ASR notes:
 
 - Pass `language` to get plain text. Without it the model detects the language itself and its native preface
   (for example `language English<asr_text>`) is returned as part of `text`, once per chunk.
-- `--max-model-len 2048`: the artifact config declares `max_position_embeddings: 65536`, but the compiled
-  decoder's cache holds 4096 tokens, and a request whose audio runs past token 2048 can stall the NPU. Without
-  the flag, an over-long request fails inside the engine and the server has to be restarted.
+- vllm-mblt clamps `max_model_len` to 2048 for this model, so longer prompts get a 400: the artifact config
+  declares 65536, but a request whose audio runs past token 2048 can stall the NPU.
 - `--max-num-seqs 1`: the artifact config declares no `max_batch_size`, so without the flag vLLM interleaves
   requests on the batch-1 compiled decoder, and four concurrent requests take roughly 3-3.5x as long as sending
   them one by one.
