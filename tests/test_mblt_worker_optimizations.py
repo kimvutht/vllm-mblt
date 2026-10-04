@@ -2123,6 +2123,357 @@ class TestMbltWorkerOptimizations:
 
         assert worker._needs_last_logit_prompt_logprob_microsteps(req_state, sequence_length=128)
 
+    def _make_fake_batch_mxq(
+        self,
+        *,
+        full_logits: bool,
+        vocab_size: int,
+        max_batch_size: int,
+        next_token: dict[int, list[int]],
+        infer_calls: list[tuple[tuple[int, int, int], ...]],
+        token_budget: int = 256,
+    ) -> SimpleNamespace:
+        """Fake batch MXQ with the shapes a real one reports.
+
+        Both kinds declare ``[1, -1, vocab]``; the output buffer's max width is
+        the token budget for a full-logits MXQ and the row count for a
+        last-logit one (Llama-3.2-1B bs16 reports input 256 / output 16).
+        ``infer`` returns ``[1, 1, rows, vocab]`` as qbruntime does for a batch
+        MXQ, one row per packed token or one per request.
+        ``next_token[cache_id][p]`` is the token the logits at absolute
+        position ``p`` of that slot predict.
+        """
+
+        def infer(inputs, *, params):
+            text_input = np.asarray(inputs[0])
+            assert text_input.ndim == 4
+            call = tuple((int(p.sequence_length), int(p.cache_size), int(p.cache_id)) for p in params)
+            assert text_input.shape[2] == sum(seq_len for seq_len, _, _ in call)
+            infer_calls.append(call)
+            rows = []
+            for seq_len, cache_size, cache_id in call:
+                positions = range(cache_size, cache_size + seq_len) if full_logits else [cache_size + seq_len - 1]
+                for position in positions:
+                    row = np.full(vocab_size, -40.0, dtype=np.float32)
+                    row[next_token[cache_id][position]] = 40.0
+                    rows.append(row)
+            return [np.stack(rows)[None, None]]
+
+        output_width = token_budget if full_logits else max_batch_size
+        return SimpleNamespace(
+            infer=infer,
+            get_model_output_shape=lambda: [(1, -1, vocab_size)],
+            get_input_buffer_info=lambda: [SimpleNamespace(max_width=token_budget)],
+            get_output_buffer_info=lambda: [SimpleNamespace(max_width=output_width)],
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(get_model_input_shape=lambda: [(1, -1, 4)]),
+        )
+
+    def _make_batch_prompt_state(
+        self,
+        worker: MbltWorker,
+        prompt_token_ids: list[int],
+        *,
+        slot_id: int,
+        prompt_logprobs: bool,
+        output_token_ids: list[int] | None = None,
+    ) -> RequestState:
+        sampling_params = (
+            SamplingParams.from_optional(temperature=0.0, prompt_logprobs=1)
+            if prompt_logprobs
+            else SamplingParams.from_optional(temperature=0.0)
+        )
+        req_state = self._make_request_state(
+            worker, sampling_params, prompt_token_ids, output_token_ids=output_token_ids
+        )
+        req_state.prompt_len = len(prompt_token_ids)
+        req_state.prompt_embeds = np.ones((len(prompt_token_ids), 4), dtype=np.float32)
+        req_state.cache_slot_id = slot_id
+        if output_token_ids:
+            req_state.num_computed_tokens = len(prompt_token_ids)
+        return req_state
+
+    def _make_batch_worker(self, max_batch_size: int) -> MbltWorker:
+        worker = self._make_worker()
+        worker.max_batch_size = max_batch_size
+        worker.runtime_cache = MbltRuntimeCacheManager(max_batch_size=max_batch_size, block_size=128)
+        worker.input_embeddings = lambda token_ids: torch.ones((int(token_ids.shape[0]), 4), dtype=torch.float32)
+        worker._load_snapshot_if_needed = lambda _req_id, req_state, **_kwargs: int(req_state.num_computed_tokens)
+        return worker
+
+    @pytest.mark.parametrize(
+        ("input_width", "output_width", "expected"),
+        [
+            # Full-logits batch MXQ: every packed input position reaches lm_head.
+            (256, 256, "full_sequence"),
+            # Last-logit batch MXQ (Llama-3.2-1B bs16 reports 256 / 16).
+            (256, 16, "last_token"),
+            # Boundary: token budget equal to max_batch_size (16), so one row per
+            # request and one row per token have the same bound; undecidable.
+            (16, 16, "unknown"),
+            # Output wider than input fits neither kind.
+            (256, 512, "unknown"),
+            (None, 256, "unknown"),
+            (256, None, "unknown"),
+        ],
+    )
+    def test_batch_dynamic_output_is_classified_by_buffer_widths(
+        self,
+        input_width: int | None,
+        output_width: int | None,
+        expected: str,
+    ) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 16
+        cache_model = SimpleNamespace(get_model_output_shape=lambda: [(1, -1, 8)])
+        if input_width is not None:
+            cache_model.get_input_buffer_info = lambda: [SimpleNamespace(max_width=input_width)]
+        if output_width is not None:
+            cache_model.get_output_buffer_info = lambda: [SimpleNamespace(max_width=output_width)]
+        worker.cache_model = cache_model
+
+        assert worker._runtime_output_logits_mode(input_seq_len=128) == expected
+
+    def test_batch_static_output_stays_unknown_even_with_matching_buffer_widths(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 16
+        worker.cache_model = SimpleNamespace(
+            get_model_output_shape=lambda: [(1, 128, 8)],
+            get_input_buffer_info=lambda: [SimpleNamespace(max_width=256)],
+            get_output_buffer_info=lambda: [SimpleNamespace(max_width=256)],
+        )
+
+        assert worker._runtime_output_logits_mode(input_seq_len=128) == "unknown"
+
+    def test_batch_full_logits_prompt_logprobs_take_one_prefill_without_microsteps(self) -> None:
+        worker = self._make_batch_worker(max_batch_size=4)
+        vocab_size = 64
+        scored_prompt = [11, 12, 13, 14, 15]
+        plain_prompt = [21, 22, 23]
+        next_token = {
+            0: scored_prompt[1:] + [41],
+            1: plain_prompt[1:] + [42],
+        }
+        infer_calls: list[tuple[tuple[int, int, int], ...]] = []
+        worker.cache_model = self._make_fake_batch_mxq(
+            full_logits=True,
+            vocab_size=vocab_size,
+            max_batch_size=4,
+            next_token=next_token,
+            infer_calls=infer_calls,
+        )
+        worker._run_prompt_logprob_microsteps_batch = lambda *_args, **_kwargs: pytest.fail(
+            "full-logits batch MXQ took the 1-token prompt-logprob microstep path"
+        )
+        chunked_results: list[dict[int, InferenceLogits]] = []
+        infer_chunked = worker._infer_normal_logits_batch_chunked
+
+        def record_chunked(**kwargs):
+            result = infer_chunked(**kwargs)
+            chunked_results.append(result)
+            return result
+
+        worker._infer_normal_logits_batch_chunked = record_chunked
+        worker.req_states = {
+            "scored": self._make_batch_prompt_state(worker, scored_prompt, slot_id=0, prompt_logprobs=True),
+            "plain": self._make_batch_prompt_state(worker, plain_prompt, slot_id=1, prompt_logprobs=False),
+        }
+
+        output = worker.execute_model(self._make_scheduler_output({"scored": 5, "plain": 3}))
+
+        assert output is not None
+        # One packed prefill for both requests: no per-token microsteps.
+        assert infer_calls == [((5, 0, 0), (3, 0, 1))]
+        assert output.prompt_logprobs_dict.keys() == {"scored"}
+        prompt_logprobs_tensors = output.prompt_logprobs_dict["scored"]
+        assert prompt_logprobs_tensors.logprob_token_ids[:, 0].tolist() == scored_prompt[1:]
+        assert output.sampled_token_ids[output.req_id_to_index["scored"]].tolist() == [41]
+        assert output.sampled_token_ids[output.req_id_to_index["plain"]].tolist() == [42]
+        # Only the prompt-logprob row keeps its per-position logits.
+        assert len(chunked_results) == 1
+        scored_logits = chunked_results[0][output.req_id_to_index["scored"]]
+        plain_logits = chunked_results[0][output.req_id_to_index["plain"]]
+        assert scored_logits.full_sequence_logits is not None
+        assert scored_logits.full_sequence_logits.shape == (5, vocab_size)
+        assert plain_logits.full_sequence_logits is None
+
+    def test_batch_full_logits_rows_without_prompt_logprobs_drop_sequence_logits(self) -> None:
+        worker = self._make_batch_worker(max_batch_size=4)
+        vocab_size = 64
+        next_token = {0: [12, 13, 14, 41], 1: [22, 23, 42]}
+        infer_calls: list[tuple[tuple[int, int, int], ...]] = []
+        worker.cache_model = self._make_fake_batch_mxq(
+            full_logits=True,
+            vocab_size=vocab_size,
+            max_batch_size=4,
+            next_token=next_token,
+            infer_calls=infer_calls,
+        )
+
+        outputs = worker._infer_normal_logits_batch_chunked(
+            output_indices=[0, 1],
+            input_embeds_batch=[np.ones((4, 4), dtype=np.float32), np.ones((3, 4), dtype=np.float32)],
+            cache_sizes=[0, 0],
+            cache_ids=[0, 1],
+            keep_sequence_logits=[True, False],
+        )
+
+        assert infer_calls == [((4, 0, 0), (3, 0, 1))]
+        kept, dropped = outputs[0], outputs[1]
+        assert kept.full_sequence_logits is not None
+        assert kept.full_sequence_logits.argmax(axis=-1).tolist() == [12, 13, 14, 41]
+        assert dropped.full_sequence_logits is None
+        assert int(dropped.last_token_logits.argmax()) == 42
+        # Only the last row is kept, not a view into the [tokens, vocab] output.
+        assert dropped.last_token_logits.base is None
+
+    def test_batch_compiled_rows_bound_full_sequence_when_max_batch_size_is_lowered(self) -> None:
+        worker = self._make_worker()
+        # max_num_seqs override below the MXQ's compiled batch of 16.
+        worker.max_batch_size = 8
+        worker.cache_model = SimpleNamespace(
+            get_model_output_shape=lambda: [(1, -1, 8)],
+            get_input_buffer_info=lambda: [SimpleNamespace(max_width=16)],
+            get_output_buffer_info=lambda: [SimpleNamespace(max_width=16)],
+            get_cache_infos=lambda: [SimpleNamespace(num_batches=16)],
+        )
+
+        assert worker._runtime_output_logits_mode(input_seq_len=4) == "unknown"
+
+    def _run_batch_group(self, worker: MbltWorker, sequence_lengths: list[int], output: np.ndarray):
+        worker.cache_model = SimpleNamespace(
+            infer=lambda _inputs, *, params: [output],
+            get_num_model_variants=lambda: 1,
+            get_model_variant_handle=lambda _idx: SimpleNamespace(get_model_input_shape=lambda: [(1, -1, 4)]),
+        )
+        return worker._infer_logits_batch_group(
+            worker.cache_model,
+            [np.ones((seq_len, 4), dtype=np.float32) for seq_len in sequence_lengths],
+            [0] * len(sequence_lengths),
+            list(range(len(sequence_lengths))),
+            None,
+            None,
+        )
+
+    def test_batch_group_rejects_rows_matching_neither_tokens_nor_requests(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 4
+        # Two requests, 3 + 1 tokens: neither 4 rows nor 2 rows.
+        with pytest.raises(RuntimeError, match="unexpected sequence length"):
+            self._run_batch_group(worker, [3, 1], np.zeros((1, 1, 3, 8), dtype=np.float32))
+
+    def test_batch_group_rejects_empty_input_slice(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 4
+        worker.cache_model = SimpleNamespace(infer=lambda *_args, **_kwargs: pytest.fail("infer ran"))
+        # Two rows for two requests would pass the last-token reading, so the
+        # empty slice must be refused before infer, not after.
+        with pytest.raises(RuntimeError, match="empty input embedding slice"):
+            self._run_batch_group(worker, [2, 0], np.zeros((1, 1, 2, 8), dtype=np.float32))
+
+    def test_batch_group_full_logits_rows_do_not_view_the_chunk_output(self) -> None:
+        worker = self._make_worker()
+        worker.max_batch_size = 4
+        output = np.arange(4 * 8, dtype=np.float32).reshape(1, 1, 4, 8)
+
+        logits = self._run_batch_group(worker, [3, 1], output)
+
+        assert [row.full_sequence_logits.shape for row in logits] == [(3, 8), (1, 8)]
+        for row in logits:
+            assert not np.shares_memory(row.full_sequence_logits, output)
+            assert not np.shares_memory(row.last_token_logits, output)
+        np.testing.assert_array_equal(logits[0].full_sequence_logits, output[0, 0, :3])
+        np.testing.assert_array_equal(logits[1].last_token_logits, output[0, 0, 3])
+
+    def test_batch_last_logit_prompt_logprobs_still_use_microsteps(self) -> None:
+        worker = self._make_batch_worker(max_batch_size=4)
+        vocab_size = 64
+        scored_prompt = [11, 12, 13, 14]
+        next_token = {0: scored_prompt[1:] + [41]}
+        infer_calls: list[tuple[tuple[int, int, int], ...]] = []
+        worker.cache_model = self._make_fake_batch_mxq(
+            full_logits=False,
+            vocab_size=vocab_size,
+            max_batch_size=4,
+            next_token=next_token,
+            infer_calls=infer_calls,
+        )
+        worker.req_states = {
+            "scored": self._make_batch_prompt_state(worker, scored_prompt, slot_id=0, prompt_logprobs=True),
+        }
+
+        output = worker.execute_model(self._make_scheduler_output({"scored": 4}))
+
+        assert output is not None
+        assert infer_calls == [((1, pos, 0),) for pos in range(len(scored_prompt))]
+        prompt_logprobs_tensors = output.prompt_logprobs_dict["scored"]
+        assert prompt_logprobs_tensors.logprob_token_ids[:, 0].tolist() == scored_prompt[1:]
+        assert output.sampled_token_ids[output.req_id_to_index["scored"]].tolist() == [41]
+
+    @pytest.mark.parametrize("full_logits", [True, False])
+    def test_batch_mixed_decode_and_prefill_sample_each_request_last_logits(self, full_logits: bool) -> None:
+        worker = self._make_batch_worker(max_batch_size=4)
+        vocab_size = 64
+        # Two requests decode one token each while a third prefills four: the
+        # full-logits output has 6 rows, the last-logit output 3.
+        decode_a = self._make_batch_prompt_state(
+            worker, [1, 2, 3], slot_id=0, prompt_logprobs=False, output_token_ids=[30]
+        )
+        decode_b = self._make_batch_prompt_state(
+            worker, [4, 5], slot_id=1, prompt_logprobs=False, output_token_ids=[31]
+        )
+        prefill = self._make_batch_prompt_state(worker, [6, 7, 8, 9], slot_id=2, prompt_logprobs=False)
+        next_token = {
+            0: [0, 0, 30, 50],
+            1: [0, 31, 51],
+            2: [7, 8, 9, 52],
+        }
+        infer_calls: list[tuple[tuple[int, int, int], ...]] = []
+        worker.cache_model = self._make_fake_batch_mxq(
+            full_logits=full_logits,
+            vocab_size=vocab_size,
+            max_batch_size=4,
+            next_token=next_token,
+            infer_calls=infer_calls,
+        )
+        worker.req_states = {"decode-a": decode_a, "decode-b": decode_b, "prefill": prefill}
+
+        output = worker.execute_model(self._make_scheduler_output({"decode-a": 1, "decode-b": 1, "prefill": 4}))
+
+        assert output is not None
+        assert infer_calls == [((1, 3, 0), (1, 2, 1), (4, 0, 2))]
+        assert output.sampled_token_ids[output.req_id_to_index["decode-a"]].tolist() == [50]
+        assert output.sampled_token_ids[output.req_id_to_index["decode-b"]].tolist() == [51]
+        assert output.sampled_token_ids[output.req_id_to_index["prefill"]].tolist() == [52]
+
+    @pytest.mark.parametrize("full_logits", [True, False])
+    def test_batch_all_decode_step_rows_coincide_for_full_and_last_logits(self, full_logits: bool) -> None:
+        worker = self._make_batch_worker(max_batch_size=4)
+        vocab_size = 64
+        states = {
+            f"req-{slot}": self._make_batch_prompt_state(
+                worker, [1, 2], slot_id=slot, prompt_logprobs=False, output_token_ids=[10 + slot]
+            )
+            for slot in range(3)
+        }
+        next_token = {slot: [0, 10 + slot, 20 + slot] for slot in range(3)}
+        infer_calls: list[tuple[tuple[int, int, int], ...]] = []
+        worker.cache_model = self._make_fake_batch_mxq(
+            full_logits=full_logits,
+            vocab_size=vocab_size,
+            max_batch_size=4,
+            next_token=next_token,
+            infer_calls=infer_calls,
+        )
+        worker.req_states = states
+
+        output = worker.execute_model(self._make_scheduler_output({req_id: 1 for req_id in states}))
+
+        assert output is not None
+        assert infer_calls == [((1, 2, 0), (1, 2, 1), (1, 2, 2))]
+        for slot in range(3):
+            assert output.sampled_token_ids[output.req_id_to_index[f"req-{slot}"]].tolist() == [20 + slot]
+
     def test_sampling_penalties_can_be_forced_off_for_non_cuda_runtime(self) -> None:
         worker = self._make_worker()
         worker.enable_sampling_penalties = False
