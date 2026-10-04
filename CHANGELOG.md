@@ -7,6 +7,8 @@
 - Qwen3-ASR (`mobilint/Qwen3-ASR-1.7B`) can now be served for speech-to-text on `/v1/audio/transcriptions`,
   through the new `qwen-asr` optional extra.
 
+## 0.6.1
+
 ### Changed
 
 - Batch MXQs built with full logits now serve prompt logprobs (`echo=true`) from the prefill's per-position
